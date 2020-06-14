@@ -242,14 +242,19 @@ def plot_graph(tr_data, te_data):
         p_timeaxis = np.linspace(0, (1 / sr * _tmp1.shape[0]), len(_tmp1))
 
         # And plot them
-        f1 = plt.figure(1, figsize=(14, 4))
-        plt.subplot(211)
+        plt.figure(1, figsize=(10, 4))
+
+        #plt.subplot(211)
         plt.plot(p_timeaxis, _tmp1)
         plt.plot(p_timeaxis, _tmp2)
         plt.plot(p_timeaxis, _tmp3)
         plt.plot(p_timeaxis, _tmp4)
         plt.plot(p_timeaxis, _tmp5)
         plt.plot(p_timeaxis, _tmp6)
+        yminmax = (x_train[0, :, :].min(), x_train[0,:,:].max())
+        #ymin, ymax = min(_tmp6),
+        plt.ylim(yminmax[0], yminmax[1])
+        #plt.xlim(0, 10)
 
         plt.title(label)
         plt.show()
@@ -395,7 +400,7 @@ if __name__ == "__main__":
     data_path = "./mlpr20_project_train_data"
 
     tr_data, te_data = load_datasets(data_path, False, shuffle= True)
-    #plot_graph()
+    #plot_graph()qq
     plot_graph(tr_data, te_data )
     #exam_all_train(tr_data, te_data )
     #for i in range(6):

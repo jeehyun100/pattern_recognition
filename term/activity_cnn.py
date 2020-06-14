@@ -7,7 +7,7 @@ from keras.utils.np_utils import to_categorical
 import matplotlib.pyplot as plt
 from keras.layers import Input, Add, Dense, Activation, ZeroPadding2D, BatchNormalization, Flatten, Conv2D
 from keras.layers import AveragePooling2D, MaxPooling2D, GlobalMaxPooling2D
-from keras.callbacks import ModelCheckpoint, Callback, EarlyStopping
+from keras.callbacks import ModelCheckpoint, Callback, EarlyStopping, ReduceLROnPlateau
 from keras.models import Model
 from keras.initializers import glorot_uniform
 from sklearn.model_selection import train_test_split
@@ -15,6 +15,8 @@ from sklearn import metrics
 from sklearn import cluster
 import sys
 import librosa
+from keras import backend as K
+from resnet import ResnetBuilder
 
 
 
@@ -158,7 +160,7 @@ def load_datasets_by_label(tr_data, te_data, grid_search=False, label = None, ty
         train_y = tr_data_by_label[:,0:1].astype(int)-1
         test_x =  np.array([x for x in te_data_by_label[:,3]])
         test_y = te_data_by_label[:,0:1].astype(int)-1
-    elif 'fft' in type:
+    elif 'fft' == type:
         #train_x = tr_data_by_label[:,3]
         train_x_s = np.array([get_log_mel_transform(x) for x in tr_data_by_label[:,3]])
         train_x = np.squeeze(train_x_s)
@@ -168,7 +170,7 @@ def load_datasets_by_label(tr_data, te_data, grid_search=False, label = None, ty
         test_y = te_data_by_label[:,0:1].astype(int)-1
         del train_x_s
         del test_x_s
-    elif 'nnftt' in type:
+    elif 'nnfft' == type:
         #train_x = tr_data_by_label[:,3]
         train_x_s = np.array([get_log_mel_transform(x,"NN") for x in tr_data_by_label[:,3]])
         train_x = np.squeeze(train_x_s)
@@ -350,10 +352,10 @@ def load_datasets(data_path, npz=None , shuffle= False):#, activity_class="ALL",
                 print(cnt)
             #     break
         np_all_data = np.array(rowlist)
-        np.savez("./npz/activity_nparray2.npz", data = np_all_data)
+        np.savez("./npz/activity_nparray3.npz", data = np_all_data)
         print("save complete")
     else:
-        np_all_data = np.load("./npz/activity_nparray2.npz",allow_pickle=True)['data']
+        np_all_data = np.load("./npz/activity_nparray3.npz",allow_pickle=True)['data']
     tr_data, te_data,  = train_test_split(np_all_data,test_size=0.3,shuffle=shuffle,random_state=1004)
 
     return tr_data, te_data
@@ -376,7 +378,7 @@ def get_melfb(sr, nfft, n_mels):
 
 data_path = "./mlpr20_project_train_data"
 tr_data, te_data = load_datasets(data_path, False, shuffle=True)
-X_train, y_train, X_test, y_test = load_datasets_by_label(tr_data, te_data, label=None, type='nnvq')
+X_train, y_train, X_test, y_test = load_datasets_by_label(tr_data, te_data, label=None, type='nnfft')#nnvq
 #x_train, y_train, x_test, y_test = load_datasets_by_label(tr_data, te_data,  label=None, type='fft')
 X_train = np.expand_dims(X_train, axis=3)
 X_test =  np.expand_dims(X_test, axis=3)
@@ -519,9 +521,99 @@ def resNet(input_shape):
     return model
 
 
-model = resNet(input_shape)
+def resNet_30(input_shape):
+    # Define the input as a tensor with shape input_shape
+    X_input = Input((input_shape))
 
-nb_epoch = 1
+    # Zero-Padding
+    X = ZeroPadding2D((3, 3))(X_input)
+
+    # Stage 1
+    X = Conv2D(64, (7, 7), strides=(2, 2), name='conv1', )(X)
+    X = BatchNormalization(axis=3, name='bn_conv1')(X)
+    X = Activation('relu')(X)
+    X = MaxPooling2D((3, 3), strides=(2, 2))(X)
+
+    # Stage 2
+    X = convolutional_block(X, f=3, filters=[64, 64, 256], stage=2, block='a', s=1)
+    X = identity_block(X, 3, [64, 64, 256], stage=2, block='b')
+    X = identity_block(X, 3, [64, 64, 256], stage=2, block='c')
+
+    # Stage 3
+    X = convolutional_block(X, f=3, filters=[128, 128, 512], stage=3, block='a', s=2)
+    X = identity_block(X, 3, [128, 128, 512], stage=3, block='b')
+    X = identity_block(X, 3, [128, 128, 512], stage=3, block='c')
+    X = identity_block(X, 3, [128, 128, 512], stage=3, block='d')
+
+    # Stage 4
+    X = convolutional_block(X, f=3, filters=[256, 256, 1024], stage=4, block='a', s=2)
+    X = identity_block(X, 3, [256, 256, 1024], stage=4, block='b')
+    X = identity_block(X, 3, [256, 256, 1024], stage=4, block='c')
+    X = identity_block(X, 3, [256, 256, 1024], stage=4, block='d')
+    X = identity_block(X, 3, [256, 256, 1024], stage=4, block='e')
+    X = identity_block(X, 3, [256, 256, 1024], stage=4, block='f')
+
+    # Stage 5
+    X = convolutional_block(X, f=3, filters=[512, 512, 2048], stage=5, block='a', s=2)
+    X = identity_block(X, 3, [512, 512, 2048], stage=5, block='b')
+    X = identity_block(X, 3, [512, 512, 2048], stage=5, block='c')
+
+    # AVGPOOL
+    # X = AveragePooling2D((2,2), name='avg_pool')(X)
+
+    # output layer
+    X = Flatten()(X)
+    X = Dense(y_train_onehot.shape[1], activation='softmax', name='fc' + str(y_train_onehot.shape[1]))(X)
+
+    # Create model
+    model = Model(inputs=X_input, outputs=X, name='ResNet50')
+
+    # Compile the model
+    model.compile(optimizer=optimizer, loss=objective, metrics=['accuracy'])
+
+    return model
+
+
+import pytest
+from keras import backend as K
+from resnet import ResnetBuilder
+
+
+DIM_ORDERING = {'th', 'tf'}
+#DIM_ORDERING = {'tf'}
+
+def _test_model_compile(model):
+    K.set_image_data_format('channels_last')
+    model.compile(loss="categorical_crossentropy", optimizer="sgd")
+    return model
+
+
+def test_resnet18(input_shape, n_classes):
+    model = ResnetBuilder.build_resnet_18((input_shape[0], input_shape[1], input_shape[2]), n_classes)
+    model.compile(optimizer=optimizer, loss=objective, metrics=['accuracy'])
+    return model
+    #_test_model_compile(model)
+
+
+def test_resnet34(input_shape, n_classes):
+    model = ResnetBuilder.build_resnet_34((input_shape[0], input_shape[1], input_shape[2]), n_classes)
+    model.compile(optimizer=optimizer, loss=objective, metrics=['accuracy'])
+    return model
+    #_test_model_compile(model)
+
+
+def test_resnet50(input_shape, n_classes):
+    model = ResnetBuilder.build_resnet_50((input_shape[0], input_shape[1], input_shape[2]), n_classes)
+    #model.compile(loss="categorical_crossentropy", optimizer="sgd")
+    model.compile(optimizer=optimizer, loss=objective, metrics=['accuracy'])
+    #model = _test_model_compile(model)
+    return model
+# model = resNet(input_shape)
+#model = test_resnet50(input_shape,n_classes)
+model = test_resnet34(input_shape,n_classes)
+
+model.summary()
+nb_epoch = 50
 batch_size = 128
 
 
@@ -540,15 +632,17 @@ class LossHistory(Callback):
         self.val_acc.append(logs.get('val_acc'))
 
 
-early_stopping = EarlyStopping(monitor='val_loss', patience=100, verbose=1, mode='auto')
-
+early_stopping = EarlyStopping(monitor='val_loss', patience=10, verbose=1, mode='auto')
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.1,
+                              patience=5, min_lr=0.00001, verbose=1)
+mcp_save = ModelCheckpoint('./save/resnet_cnn.hdf5', save_best_only=True, monitor='val_loss', mode='min', verbose = 1)
 
 def run_resNet(input_shape):
     history = LossHistory()
     # x_train & x_test reshaped because of single channel !
     model.fit(X_train.reshape((-1, input_shape[0], input_shape[1], input_shape[2])), y_train_onehot, batch_size=batch_size, epochs=nb_epoch,
               validation_data=(X_test, y_test_onehot),#validation_split=0.25,
-              verbose=1, shuffle=True, callbacks=[history, early_stopping])
+              verbose=1, shuffle=True, callbacks=[history, early_stopping, reduce_lr,mcp_save])
 
     predictions = model.predict(X_test.reshape((-1,  input_shape[0], input_shape[1], input_shape[2])), verbose=0)
     return predictions, history
@@ -616,8 +710,12 @@ def draw_plot(one_hot_predictions,y_test ):
     plt.tight_layout()
     plt.ylabel('True label')
     plt.xlabel('Predicted label')
+    plt.savefig('resnet_cnn_50.png')
     plt.show()
 
+
+
+os.makedirs("./save/", exist_ok=True)
 predictions, history = run_resNet(input_shape)
 
 draw_plot(predictions, y_test)

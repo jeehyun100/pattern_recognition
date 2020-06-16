@@ -1,28 +1,264 @@
-
 import os
 import numpy as np
-from keras import layers
-from keras.datasets import mnist
 from keras.utils.np_utils import to_categorical
 import matplotlib.pyplot as plt
-from keras.layers import Input, Add, Dense, Activation, ZeroPadding2D, BatchNormalization, Flatten, Conv2D
-from keras.layers import AveragePooling2D, MaxPooling2D, GlobalMaxPooling2D
 from keras.callbacks import ModelCheckpoint, Callback, EarlyStopping, ReduceLROnPlateau
-from keras.models import Model
-from keras.initializers import glorot_uniform
 from sklearn.model_selection import train_test_split
 from sklearn import metrics
 from sklearn import cluster
 import sys
 import librosa
+import six
+from keras.models import Model
+from keras.layers import (
+    Input,
+    Activation,
+    Dense,
+    Flatten
+)
+from keras.layers.convolutional import (
+    Conv2D,
+    MaxPooling2D,
+    AveragePooling2D
+)
+from keras.layers.merge import add
+from keras.layers.normalization import BatchNormalization
+from keras.regularizers import l2
+import glob
 from keras import backend as K
-from resnet import ResnetBuilder
+from resnet_bk import ResnetBuilder
+
+def _bn_relu(input):
+    """Helper to build a BN -> relu block
+    """
+    norm = BatchNormalization(axis=CHANNEL_AXIS)(input)
+    return Activation("relu")(norm)
 
 
+def _conv_bn_relu(**conv_params):
+    """Helper to build a conv -> BN -> relu block
+    """
+    filters = conv_params["filters"]
+    kernel_size = conv_params["kernel_size"]
+    strides = conv_params.setdefault("strides", (1, 1))
+    kernel_initializer = conv_params.setdefault("kernel_initializer", "he_normal")
+    padding = conv_params.setdefault("padding", "same")
+    kernel_regularizer = conv_params.setdefault("kernel_regularizer", l2(1.e-4))
 
-# Useful Constants
+    def f(input):
+        conv = Conv2D(filters=filters, kernel_size=kernel_size,
+                      strides=strides, padding=padding,
+                      kernel_initializer=kernel_initializer,
+                      kernel_regularizer=kernel_regularizer)(input)
+        return _bn_relu(conv)
 
-# Those are separate normalised input features for the neural network
+    return f
+
+
+def _bn_relu_conv(**conv_params):
+    """Helper to build a BN -> relu -> conv block.
+    This is an improved scheme proposed in http://arxiv.org/pdf/1603.05027v2.pdf
+    """
+    filters = conv_params["filters"]
+    kernel_size = conv_params["kernel_size"]
+    strides = conv_params.setdefault("strides", (1, 1))
+    kernel_initializer = conv_params.setdefault("kernel_initializer", "he_normal")
+    padding = conv_params.setdefault("padding", "same")
+    kernel_regularizer = conv_params.setdefault("kernel_regularizer", l2(1.e-4))
+
+    def f(input):
+        activation = _bn_relu(input)
+        return Conv2D(filters=filters, kernel_size=kernel_size,
+                      strides=strides, padding=padding,
+                      kernel_initializer=kernel_initializer,
+                      kernel_regularizer=kernel_regularizer)(activation)
+
+    return f
+
+
+def _shortcut(input, residual):
+    """Adds a shortcut between input and residual block and merges them with "sum"
+    """
+    # Expand channels of shortcut to match residual.
+    # Stride appropriately to match residual (width, height)
+    # Should be int if network architecture is correctly configured.
+    input_shape = K.int_shape(input)
+    residual_shape = K.int_shape(residual)
+    stride_width = int(round(input_shape[ROW_AXIS] / residual_shape[ROW_AXIS]))
+    stride_height = int(round(input_shape[COL_AXIS] / residual_shape[COL_AXIS]))
+    equal_channels = input_shape[CHANNEL_AXIS] == residual_shape[CHANNEL_AXIS]
+
+    shortcut = input
+    # 1 X 1 conv if shape is different. Else identity.
+    if stride_width > 1 or stride_height > 1 or not equal_channels:
+        shortcut = Conv2D(filters=residual_shape[CHANNEL_AXIS],
+                          kernel_size=(1, 1),
+                          strides=(stride_width, stride_height),
+                          padding="valid",
+                          kernel_initializer="he_normal",
+                          kernel_regularizer=l2(0.0001))(input)
+
+    return add([shortcut, residual])
+
+
+def _residual_block(block_function, filters, repetitions, is_first_layer=False):
+    """Builds a residual block with repeating bottleneck blocks.
+    """
+    def f(input):
+        for i in range(repetitions):
+            init_strides = (1, 1)
+            if i == 0 and not is_first_layer:
+                init_strides = (2, 2)
+            input = block_function(filters=filters, init_strides=init_strides,
+                                   is_first_block_of_first_layer=(is_first_layer and i == 0))(input)
+        return input
+    return f
+
+
+def basic_block(filters, init_strides=(1, 1), is_first_block_of_first_layer=False):
+    """Basic 3 X 3 convolution blocks for use on resnets with layers <= 34.
+    Follows improved proposed scheme in http://arxiv.org/pdf/1603.05027v2.pdf
+    """
+    def f(input):
+
+        if is_first_block_of_first_layer:
+            # don't repeat bn->relu since we just did bn->relu->maxpool
+            conv1 = Conv2D(filters=filters, kernel_size=(3, 3),
+                           strides=init_strides,
+                           padding="same",
+                           kernel_initializer="he_normal",
+                           kernel_regularizer=l2(1e-4))(input)
+        else:
+            conv1 = _bn_relu_conv(filters=filters, kernel_size=(3, 3),
+                                  strides=init_strides)(input)
+
+        residual = _bn_relu_conv(filters=filters, kernel_size=(3, 3))(conv1)
+        return _shortcut(input, residual)
+
+    return f
+
+
+def bottleneck(filters, init_strides=(1, 1), is_first_block_of_first_layer=False):
+    """Bottleneck architecture for > 34 layer resnet.
+    Follows improved proposed scheme in http://arxiv.org/pdf/1603.05027v2.pdf
+    Returns:
+        A final conv layer of filters * 4
+    """
+    def f(input):
+
+        if is_first_block_of_first_layer:
+            # don't repeat bn->relu since we just did bn->relu->maxpool
+            conv_1_1 = Conv2D(filters=filters, kernel_size=(1, 1),
+                              strides=init_strides,
+                              padding="same",
+                              kernel_initializer="he_normal",
+                              kernel_regularizer=l2(1e-4))(input)
+        else:
+            conv_1_1 = _bn_relu_conv(filters=filters, kernel_size=(1, 1),
+                                     strides=init_strides)(input)
+
+        conv_3_3 = _bn_relu_conv(filters=filters, kernel_size=(3, 3))(conv_1_1)
+        residual = _bn_relu_conv(filters=filters * 4, kernel_size=(1, 1))(conv_3_3)
+        return _shortcut(input, residual)
+
+    return f
+
+
+def _handle_dim_ordering():
+    global ROW_AXIS
+    global COL_AXIS
+    global CHANNEL_AXIS
+    if K.image_data_format() == 'channels_last':
+    #if K.image_dim_ordering() == 'tf':
+        ROW_AXIS = 1
+        COL_AXIS = 2
+        CHANNEL_AXIS = 3
+    else:
+        CHANNEL_AXIS = 1
+        ROW_AXIS = 2
+        COL_AXIS = 3
+
+
+def _get_block(identifier):
+    if isinstance(identifier, six.string_types):
+        res = globals().get(identifier)
+        if not res:
+            raise ValueError('Invalid {}'.format(identifier))
+        return res
+    return identifier
+
+
+class ResnetBuilder(object):
+    @staticmethod
+    def build(input_shape, num_outputs, block_fn, repetitions):
+        """Builds a custom ResNet like architecture.
+        Args:
+            input_shape: The input shape in the form (nb_channels, nb_rows, nb_cols)
+            num_outputs: The number of outputs at final softmax layer
+            block_fn: The block function to use. This is either `basic_block` or `bottleneck`.
+                The original paper used basic_block for layers < 50
+            repetitions: Number of repetitions of various block units.
+                At each block unit, the number of filters are doubled and the input size is halved
+        Returns:
+            The keras `Model`.
+        """
+        _handle_dim_ordering()
+        if len(input_shape) != 3:
+            raise Exception("Input shape should be a tuple (nb_channels, nb_rows, nb_cols)")
+
+        # Permute dimension order if necessary
+        if K.image_data_format() == 'channels_first':
+        #if K.image_dim_ordering() == 'tf':
+            input_shape = (input_shape[1], input_shape[2], input_shape[0])
+
+        # Load function from str if needed.
+        block_fn = _get_block(block_fn)
+
+        input = Input(shape=input_shape)
+        conv1 = _conv_bn_relu(filters=64, kernel_size=(7, 7), strides=(2, 2))(input)
+        pool1 = MaxPooling2D(pool_size=(3, 3), strides=(2, 2), padding="same")(conv1)
+
+        block = pool1
+        filters = 64
+        for i, r in enumerate(repetitions):
+            block = _residual_block(block_fn, filters=filters, repetitions=r, is_first_layer=(i == 0))(block)
+            filters *= 2
+
+        # Last activation
+        block = _bn_relu(block)
+
+        # Classifier block
+        block_shape = K.int_shape(block)
+        pool2 = AveragePooling2D(pool_size=(block_shape[ROW_AXIS], block_shape[COL_AXIS]),
+                                 strides=(1, 1))(block)
+        flatten1 = Flatten()(pool2)
+        dense = Dense(units=num_outputs, kernel_initializer="he_normal",
+                      activation="softmax")(flatten1)
+
+        model = Model(inputs=input, outputs=dense)
+        return model
+
+    @staticmethod
+    def build_resnet_18(input_shape, num_outputs):
+        return ResnetBuilder.build(input_shape, num_outputs, basic_block, [2, 2, 2, 2])
+
+    @staticmethod
+    def build_resnet_34(input_shape, num_outputs):
+        return ResnetBuilder.build(input_shape, num_outputs, basic_block, [3, 4, 6, 3])
+
+    @staticmethod
+    def build_resnet_50(input_shape, num_outputs):
+        return ResnetBuilder.build(input_shape, num_outputs, bottleneck, [3, 4, 6, 3])
+
+    @staticmethod
+    def build_resnet_101(input_shape, num_outputs):
+        return ResnetBuilder.build(input_shape, num_outputs, bottleneck, [3, 4, 23, 3])
+
+    @staticmethod
+    def build_resnet_152(input_shape, num_outputs):
+        return ResnetBuilder.build(input_shape, num_outputs, bottleneck, [3, 8, 36, 3])
+
+
 INPUT_SIGNAL_TYPES = [
     "body_acc_x_",
     "body_acc_y_",
@@ -32,12 +268,10 @@ INPUT_SIGNAL_TYPES = [
     "body_gyro_z_",
 ]
 
-
 # Output classes to learn how to classify
 LABELS = ['Walking', 'Walking upstairs', 'Walking downstairs', 'Sitting', 'Standing', 'Laying']
-
-
 n_classes = 6
+# Init param with VQ
 vq_cluster = 5
 init_param_0 = np.array([0.02095179, 0.90566462, 0.43209739, -0.25544495, -0.77559784])
 init_param_1 = np.array([0.02232163, 0.43481753, -0.76255045, 0.9057137, -0.25071883])
@@ -45,16 +279,7 @@ init_param_2 = np.array([-0.25389706, 0.43028382, 0.02092518, 0.90301782, -0.767
 init_param_3 = np.array([0.02219885, 0.90365064, -0.24924463, 0.43321321, -0.75605498])
 init_param_4 = np.array([-0.25172194, 0.89856953, 0.41381263, 0.01912027, -0.75912962])
 init_param_5 = np.array([0.01752499, 0.896993, -0.76920107, -0.25543445, 0.4079556])
-n_hidden = 16  # Hidden layer num of features
-#n_classes = 6  # Total classes (should go up, or should go down)
 
-learning_rate = 0.0025
-lambda_loss_amount = 0.0015
-
-batch_size = 1500
-display_iter = 30000  # To show test set accuracy during training
-
-#log_cnt = 0
 
 # Compute short time Fourier transformation (STFT).
 def stft(sig, nfft, win_length_time, hop_length_time, fs, window_type='hann'):
@@ -73,22 +298,23 @@ def stft(sig, nfft, win_length_time, hop_length_time, fs, window_type='hann'):
     frames = np.stack([window * sig[step * hop_sample: step * hop_sample + win_sample] for step in range(n_frames)])
 
     stft = np.fft.rfft(frames, n=nfft, axis=1)
-    #
-    # stft_frames = [ fftpack.fft(x,N) for x in frames]
     freq_axis = np.linspace(0,fs,n_frames)
-    # return(stft_frames, freq_axis)
-
     return stft, freq_axis
 
+
 def get_log_mel_transform(p_data, type = None):
-    #_tmp = train_x[0, :, 0]
-    p_s = p_data[:,0]
-    nfft = 512
-    window_len = 0.4#0.3#0.5  # 1.0#0.3
-    hop_len = 0.1#0.1  # 0.5
+    # nfft = 512
+    # window_len = 0.4#0.3#0.5  # 1.0#0.3
+    # hop_len = 0.1#0.1  # 0.5
+    # sr = 50
+    # win_type = 'hann'
+    # n_coeff = 8
+    nfft = 128
+    window_len = 1.3  # 0.3#0.5  # 1.0#0.3
+    hop_len = 0.3  # 0.1  # 0.5
     sr = 50
     win_type = 'hann'
-    n_coeff = 8
+    n_coeff = 48
 
     p_s = p_data[:,0]
     p_stft, freq_axis = stft(p_s, nfft, window_len, hop_len, sr, window_type=win_type)
@@ -116,38 +342,22 @@ def get_log_mel_transform(p_data, type = None):
     p_stft = abs(p_stft)
     feature6 = compute_log_melspectrogram(p_stft, sr, nfft, n_coeff)
 
-
     print("fft converting")
     feature = np.concatenate((feature1, feature2, feature3, feature4, feature5, feature6), axis=1)
     if type != "NN":
         feature = feature.flatten()
-
-
     return feature
 
 
 def load_datasets_by_label(tr_data, te_data, grid_search=False, label = None, type='flatten'):#, activity_class="ALL", one_hot=False):
-    """selete data by label
-
-    Args:
-        data_path (string) : Path data load
-        dataset_name : For seleced dataset name  ['p1', 'p2']
-
-    Returns:
-        2-D Array: P1 Train data
-        2-D Array: P1 Test data
-        2-D Array: P2 Train data
-        2-D Array: P2 Test data
-
+    """
+        select data by label
     """
     tr_data_by_label = tr_data
     te_data_by_label = te_data
-    #tr_data_by_label = tr_data_by_label[np.where(tr_data_by_label[:, 0] == 1)][:, 3]
-    #flatten_arr = [x.flatten()for x in tr_data_by_label]
     if label is not None:
         tr_data_by_label = tr_data[np.where(tr_data[:,0]==str(label))]
         te_data_by_label = te_data[np.where(te_data[:,0]==str(label))]
-        #np_all_data[np.where(np_all_data[:, 0] == 1)][:, 3]
 
     if 'flatten' in type:
         train_x = [x.flatten() for x in tr_data_by_label[:,3]]
@@ -155,13 +365,11 @@ def load_datasets_by_label(tr_data, te_data, grid_search=False, label = None, ty
         test_x = [x.flatten() for x in te_data_by_label[:,3]]
         test_y = te_data_by_label[:,0:1].astype(int)-1
     elif 'raw' in type:
-        #train_x = tr_data_by_label[:,3]
         train_x = np.array([x for x in tr_data_by_label[:,3]])
         train_y = tr_data_by_label[:,0:1].astype(int)-1
         test_x =  np.array([x for x in te_data_by_label[:,3]])
         test_y = te_data_by_label[:,0:1].astype(int)-1
     elif 'fft' == type:
-        #train_x = tr_data_by_label[:,3]
         train_x_s = np.array([get_log_mel_transform(x) for x in tr_data_by_label[:,3]])
         train_x = np.squeeze(train_x_s)
         train_y = tr_data_by_label[:,0:1].astype(int)-1
@@ -171,7 +379,6 @@ def load_datasets_by_label(tr_data, te_data, grid_search=False, label = None, ty
         del train_x_s
         del test_x_s
     elif 'nnfft' == type:
-        #train_x = tr_data_by_label[:,3]
         train_x_s = np.array([get_log_mel_transform(x,"NN") for x in tr_data_by_label[:,3]])
         train_x = np.squeeze(train_x_s)
         train_y = tr_data_by_label[:,0:1].astype(int)-1
@@ -198,23 +405,13 @@ def load_datasets_by_label(tr_data, te_data, grid_search=False, label = None, ty
         test_y = te_data_by_label[:,0:1].astype(int)-1
         del train_x_s
         del test_x_s
-
-
     return train_x, train_y, test_x, test_y
 
 
 def get_vq(p_data, type= None):
     """
-    make init centroid point for vq
-    :param p_data:
-    :return:
+        make init param centroid point for vq
     """
-
-    # fit # load
-    # _tmp = train_x[0, :, 0]
-    #vq_cluster
-
-
 
     p_s = p_data[:,0]
     k_means = cluster.KMeans(n_clusters=vq_cluster, init=init_param_0.reshape((-1,1)), n_init=1, verbose = 2)
@@ -269,27 +466,17 @@ def get_vq(p_data, type= None):
     labels = k_means.labels_
     vq_feature6 = np.choose(labels, values)
     vq_feature6.shape = p_s.shape
-    #feature = np.concatenate((vq_feature1, vq_feature2, vq_feature3, vq_feature4, vq_feature5, vq_feature6))
-
     if type == "NN":
         feature = np.vstack((vq_feature1, vq_feature2, vq_feature3, vq_feature4, vq_feature5, vq_feature6)).T
     else:
         feature = np.concatenate((vq_feature1, vq_feature2, vq_feature3, vq_feature4, vq_feature5, vq_feature6))
-
-
     return feature
 
 
 def get_vg_train(p_data):
     """
-    make init centroid point for vq
-    :param p_data:
-    :return:
+        make init centroid point for vq
     """
-
-    # fit # load
-    # _tmp = train_x[0, :, 0]
-    #vq_cluster
     all_centroid_init = dict()
     for i in range(6):
         list_all_data = []
@@ -302,64 +489,42 @@ def get_vg_train(p_data):
 
         values = k_means.cluster_centers_.squeeze()
         all_centroid_init[i] = values
-        #all_centroid_init.append(values)
     print(all_centroid_init)
 
-def load_datasets(data_path, npz=None , shuffle= False):#, activity_class="ALL", one_hot=False):
+
+def load_datasets(data_path, npz=None , shuffle= False):
     """Load dataset unsing numpy wih data path
         . Datasets :
           . filename : 0009_01_5.txt
             “aaaa_bb_c.txt,” where aaaa is the file ID, bb is the user ID, and c is the ground truth activity class
           . data : The six columns represent accelerations (in standard gravity unit g=9.8m/s2) in X, Y, and Z
                    directions, and angular velocities (in rad/sec) in X, Y, and Z directions
-
-    Args:
-        data_path (string) : Path data load
-        dataset_name : For seleced dataset name  ['p1', 'p2']
-
-    Returns:
-        2-D Array: P1 Train data
-        2-D Array: P1 Test data
-        2-D Array: P2 Train data
-        2-D Array: P2 Test data
-
     """
 
     if npz == None:
         cnt = 0
-        np_all_data = np.empty(shape=[0,9])
+        #np_all_data = np.empty(shape=[0,9])
         rowlist = list()
         for file in glob.glob(data_path + "/*.txt"):
-            #if str(activity_class) in os.path.basename(os.path.splitext(file)[0]).split("_")[2]:
-                #print(file)
             col_list = list()
             cnt += 1
             row = np.loadtxt(file)
             file_index, user_id, activity_class = os.path.basename(os.path.splitext(file)[0]).split("_")
-            #np_lables = np.array([activity_class, user_id,file_index])
             col_list.append(str(activity_class))
             col_list.append(int(user_id))
             col_list.append(int(file_index))
             col_list.append(row)
-
-            # no_lables_reshape = np.repeat([np_lables],row.shape[0], 0)
-            # np_p1_tr_a = np.column_stack([row, no_lables_reshape])
-
             rowlist.append(col_list)
             del col_list
-
             if cnt % 100 == 0:
                 print(cnt)
-            #     break
         np_all_data = np.array(rowlist)
         np.savez("./npz/activity_nparray3.npz", data = np_all_data)
         print("save complete")
     else:
         np_all_data = np.load("./npz/activity_nparray3.npz",allow_pickle=True)['data']
     tr_data, te_data,  = train_test_split(np_all_data,test_size=0.3,shuffle=shuffle,random_state=1004)
-
     return tr_data, te_data
-
 
 
 # Compute log mel spectrogram.
@@ -371,216 +536,12 @@ def compute_log_melspectrogram(spec, sr, nfft, n_mels):
     mel_spec = 10*np.log10(mel_spec+eps)
     return mel_spec
 
+
 # Obtain mel-scale filterbank.
 def get_melfb(sr, nfft, n_mels):
     mel_fb = librosa.filters.mel(sr, n_fft=nfft, n_mels=n_mels)
     return mel_fb
 
-data_path = "./mlpr20_project_train_data"
-tr_data, te_data = load_datasets(data_path, False, shuffle=True)
-X_train, y_train, X_test, y_test = load_datasets_by_label(tr_data, te_data, label=None, type='nnfft')#nnvq
-#x_train, y_train, x_test, y_test = load_datasets_by_label(tr_data, te_data,  label=None, type='fft')
-X_train = np.expand_dims(X_train, axis=3)
-X_test =  np.expand_dims(X_test, axis=3)
-#(x_train, y_train), (x_test, y_test) = mnist.load_data()
-y_train_onehot = to_categorical(y_train, num_classes=None, dtype='float32')
-y_test_onehot = to_categorical(y_test, num_classes=None, dtype='float32')
-
-print("Train Set Size = {} images".format(y_train.shape[0]))
-print("Test Set Size = {} images".format(y_test.shape[0]))
-
-
-
-input_shape = (X_train.shape[1],X_train.shape[2],X_train.shape[3])
-# fig1 = plt.figure(figsize = (15,15))
-#
-# for i in range(5):
-#     ax1 = fig1.add_subplot(1,5,i+1)
-#     ax1.imshow(x_train[i], interpolation='none', cmap=plt.cm.gray)
-#     ax2 = fig1.add_subplot(2,5,i+6)
-#     ax2.imshow(x_train[i+6], interpolation='none', cmap=plt.cm.gray)
-# plt.show()
-
-print("Labels : {}".format(y_train[0:5]))
-#print("Labels : {}".format(y_train[6:11]))
-
-optimizer = 'adam'
-objective = 'categorical_crossentropy'
-
-
-def identity_block(X, f, filters, stage, block):
-    conv_name_base = 'res' + str(stage) + block + '_branch'
-    bn_name_base = 'bn' + str(stage) + block + '_branch'
-
-    F1, F2, F3 = filters
-
-    X_shortcut = X
-
-    X = Conv2D(filters=F1, kernel_size=(1, 1), strides=(1, 1), padding='valid', name=conv_name_base + '2a',
-               kernel_initializer=glorot_uniform(seed=0))(X)
-    X = BatchNormalization(axis=3, name=bn_name_base + '2a')(X)
-    X = Activation('relu')(X)
-
-    X = Conv2D(filters=F2, kernel_size=(f, f), strides=(1, 1), padding='same', name=conv_name_base + '2b',
-               kernel_initializer=glorot_uniform(seed=0))(X)
-    X = BatchNormalization(axis=3, name=bn_name_base + '2b')(X)
-    X = Activation('relu')(X)
-
-    X = Conv2D(filters=F3, kernel_size=(1, 1), strides=(1, 1), padding='valid', name=conv_name_base + '2c',
-               kernel_initializer=glorot_uniform(seed=0))(X)
-    X = BatchNormalization(axis=3, name=bn_name_base + '2c')(X)
-
-    X = layers.Add()([X, X_shortcut])
-    X = Activation('relu')(X)
-
-    return X
-
-
-def convolutional_block(X, f, filters, stage, block, s=2):
-    conv_name_base = 'res' + str(stage) + block + '_branch'
-    bn_name_base = 'bn' + str(stage) + block + '_branch'
-
-    F1, F2, F3 = filters
-
-    X_shortcut = X
-
-    X = Conv2D(filters=F1, kernel_size=(1, 1), strides=(s, s), name=conv_name_base + '2a',
-               kernel_initializer=glorot_uniform(seed=0))(X)
-    X = BatchNormalization(axis=3, name=bn_name_base + '2a')(X)
-    X = Activation('relu')(X)
-
-    X = Conv2D(filters=F2, kernel_size=(f, f), strides=(1, 1), padding='same', name=conv_name_base + '2b',
-               kernel_initializer=glorot_uniform(seed=0))(X)
-    X = BatchNormalization(axis=3, name=bn_name_base + '2b')(X)
-    X = Activation('relu')(X)
-
-    X = Conv2D(filters=F3, kernel_size=(1, 1), strides=(1, 1), name=conv_name_base + '2c',
-               kernel_initializer=glorot_uniform(seed=0))(X)
-    X = BatchNormalization(axis=3, name=bn_name_base + '2c')(X)
-
-    X_shortcut = Conv2D(F3, kernel_size=(1, 1), strides=(s, s), name=conv_name_base + '1',
-                        kernel_initializer=glorot_uniform(seed=0))(X_shortcut)
-    X_shortcut = BatchNormalization(axis=3, name=bn_name_base + '1')(X_shortcut)
-
-    X = layers.Add()([X, X_shortcut])
-    X = Activation('relu')(X)
-
-    return X
-
-
-def resNet(input_shape):
-    # Define the input as a tensor with shape input_shape
-    X_input = Input((input_shape))
-
-    # Zero-Padding
-    X = ZeroPadding2D((3, 3))(X_input)
-
-    # Stage 1
-    X = Conv2D(64, (7, 7), strides=(2, 2), name='conv1', )(X)
-    X = BatchNormalization(axis=3, name='bn_conv1')(X)
-    X = Activation('relu')(X)
-    X = MaxPooling2D((3, 3), strides=(2, 2))(X)
-
-    # Stage 2
-    X = convolutional_block(X, f=3, filters=[64, 64, 256], stage=2, block='a', s=1)
-    X = identity_block(X, 3, [64, 64, 256], stage=2, block='b')
-    X = identity_block(X, 3, [64, 64, 256], stage=2, block='c')
-
-    # Stage 3
-    X = convolutional_block(X, f=3, filters=[128, 128, 512], stage=3, block='a', s=2)
-    X = identity_block(X, 3, [128, 128, 512], stage=3, block='b')
-    X = identity_block(X, 3, [128, 128, 512], stage=3, block='c')
-    X = identity_block(X, 3, [128, 128, 512], stage=3, block='d')
-
-    # Stage 4
-    X = convolutional_block(X, f=3, filters=[256, 256, 1024], stage=4, block='a', s=2)
-    X = identity_block(X, 3, [256, 256, 1024], stage=4, block='b')
-    X = identity_block(X, 3, [256, 256, 1024], stage=4, block='c')
-    X = identity_block(X, 3, [256, 256, 1024], stage=4, block='d')
-    X = identity_block(X, 3, [256, 256, 1024], stage=4, block='e')
-    X = identity_block(X, 3, [256, 256, 1024], stage=4, block='f')
-
-    # Stage 5
-    X = convolutional_block(X, f=3, filters=[512, 512, 2048], stage=5, block='a', s=2)
-    X = identity_block(X, 3, [512, 512, 2048], stage=5, block='b')
-    X = identity_block(X, 3, [512, 512, 2048], stage=5, block='c')
-
-    # AVGPOOL
-    # X = AveragePooling2D((2,2), name='avg_pool')(X)
-
-    # output layer
-    X = Flatten()(X)
-    X = Dense(y_train_onehot.shape[1], activation='softmax', name='fc' + str(y_train_onehot.shape[1]))(X)
-
-    # Create model
-    model = Model(inputs=X_input, outputs=X, name='ResNet50')
-
-    # Compile the model
-    model.compile(optimizer=optimizer, loss=objective, metrics=['accuracy'])
-
-    return model
-
-
-def resNet_30(input_shape):
-    # Define the input as a tensor with shape input_shape
-    X_input = Input((input_shape))
-
-    # Zero-Padding
-    X = ZeroPadding2D((3, 3))(X_input)
-
-    # Stage 1
-    X = Conv2D(64, (7, 7), strides=(2, 2), name='conv1', )(X)
-    X = BatchNormalization(axis=3, name='bn_conv1')(X)
-    X = Activation('relu')(X)
-    X = MaxPooling2D((3, 3), strides=(2, 2))(X)
-
-    # Stage 2
-    X = convolutional_block(X, f=3, filters=[64, 64, 256], stage=2, block='a', s=1)
-    X = identity_block(X, 3, [64, 64, 256], stage=2, block='b')
-    X = identity_block(X, 3, [64, 64, 256], stage=2, block='c')
-
-    # Stage 3
-    X = convolutional_block(X, f=3, filters=[128, 128, 512], stage=3, block='a', s=2)
-    X = identity_block(X, 3, [128, 128, 512], stage=3, block='b')
-    X = identity_block(X, 3, [128, 128, 512], stage=3, block='c')
-    X = identity_block(X, 3, [128, 128, 512], stage=3, block='d')
-
-    # Stage 4
-    X = convolutional_block(X, f=3, filters=[256, 256, 1024], stage=4, block='a', s=2)
-    X = identity_block(X, 3, [256, 256, 1024], stage=4, block='b')
-    X = identity_block(X, 3, [256, 256, 1024], stage=4, block='c')
-    X = identity_block(X, 3, [256, 256, 1024], stage=4, block='d')
-    X = identity_block(X, 3, [256, 256, 1024], stage=4, block='e')
-    X = identity_block(X, 3, [256, 256, 1024], stage=4, block='f')
-
-    # Stage 5
-    X = convolutional_block(X, f=3, filters=[512, 512, 2048], stage=5, block='a', s=2)
-    X = identity_block(X, 3, [512, 512, 2048], stage=5, block='b')
-    X = identity_block(X, 3, [512, 512, 2048], stage=5, block='c')
-
-    # AVGPOOL
-    # X = AveragePooling2D((2,2), name='avg_pool')(X)
-
-    # output layer
-    X = Flatten()(X)
-    X = Dense(y_train_onehot.shape[1], activation='softmax', name='fc' + str(y_train_onehot.shape[1]))(X)
-
-    # Create model
-    model = Model(inputs=X_input, outputs=X, name='ResNet50')
-
-    # Compile the model
-    model.compile(optimizer=optimizer, loss=objective, metrics=['accuracy'])
-
-    return model
-
-
-import pytest
-from keras import backend as K
-from resnet import ResnetBuilder
-
-
-DIM_ORDERING = {'th', 'tf'}
-#DIM_ORDERING = {'tf'}
 
 def _test_model_compile(model):
     K.set_image_data_format('channels_last')
@@ -592,29 +553,18 @@ def test_resnet18(input_shape, n_classes):
     model = ResnetBuilder.build_resnet_18((input_shape[0], input_shape[1], input_shape[2]), n_classes)
     model.compile(optimizer=optimizer, loss=objective, metrics=['accuracy'])
     return model
-    #_test_model_compile(model)
 
 
 def test_resnet34(input_shape, n_classes):
     model = ResnetBuilder.build_resnet_34((input_shape[0], input_shape[1], input_shape[2]), n_classes)
     model.compile(optimizer=optimizer, loss=objective, metrics=['accuracy'])
     return model
-    #_test_model_compile(model)
 
 
 def test_resnet50(input_shape, n_classes):
     model = ResnetBuilder.build_resnet_50((input_shape[0], input_shape[1], input_shape[2]), n_classes)
-    #model.compile(loss="categorical_crossentropy", optimizer="sgd")
     model.compile(optimizer=optimizer, loss=objective, metrics=['accuracy'])
-    #model = _test_model_compile(model)
     return model
-# model = resNet(input_shape)
-#model = test_resnet50(input_shape,n_classes)
-model = test_resnet34(input_shape,n_classes)
-
-model.summary()
-nb_epoch = 50
-batch_size = 128
 
 
 ## Callback for loss logging per epoch
@@ -631,11 +581,6 @@ class LossHistory(Callback):
         self.acc.append(logs.get('acc'))
         self.val_acc.append(logs.get('val_acc'))
 
-
-early_stopping = EarlyStopping(monitor='val_loss', patience=10, verbose=1, mode='auto')
-reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.1,
-                              patience=5, min_lr=0.00001, verbose=1)
-mcp_save = ModelCheckpoint('./save/resnet_cnn.hdf5', save_best_only=True, monitor='val_loss', mode='min', verbose = 1)
 
 def run_resNet(input_shape):
     history = LossHistory()
@@ -659,22 +604,9 @@ def test_accuracy(predictions):
     return t, float(t) * 100 / predictions.shape[0], err
 
 
-
-def draw_plot(one_hot_predictions,y_test ):
-
-
-    font = {
-        'family' : 'Bitstream Vera Sans',
-        'weight' : 'bold',
-        'size'   : 18
-    }
-
-
-
+def draw_plot(one_hot_predictions, y_tes ):
 
     predictions = one_hot_predictions.argmax(1)
-
-    #print("Testing Accuracy: {}%".format(100*accuracy))
 
     print("")
     print("Precision: {}%".format(100*metrics.precision_score(y_test, predictions, average="weighted")))
@@ -713,9 +645,44 @@ def draw_plot(one_hot_predictions,y_test ):
     plt.savefig('resnet_cnn_50.png')
     plt.show()
 
+if __name__ == "__main__":
+    os.makedirs("./save/", exist_ok=True)
+    #data_path = "./mlpr20_project_train_data"
+    data_path = "./new_dataset"
+    tr_data, te_data = load_datasets(data_path, False, shuffle=True)
+    X_train, y_train, X_test, y_test = load_datasets_by_label(tr_data, te_data, label=None, type='nnfft')#nnvq, nnfft, raw
 
+    X_train = np.expand_dims(X_train, axis=3)
+    X_test =  np.expand_dims(X_test, axis=3)
 
-os.makedirs("./save/", exist_ok=True)
-predictions, history = run_resNet(input_shape)
+    y_train_onehot = to_categorical(y_train, num_classes=None, dtype='float32')
+    y_test_onehot = to_categorical(y_test, num_classes=None, dtype='float32')
 
-draw_plot(predictions, y_test)
+    print("Train Set Size = {} images".format(y_train.shape[0]))
+    print("Test Set Size = {} images".format(y_test.shape[0]))
+
+    input_shape = (X_train.shape[1],X_train.shape[2],X_train.shape[3])
+    print("Labels : {}".format(y_train[0:5]))
+
+    optimizer = 'adam'
+    objective = 'categorical_crossentropy'
+
+    model_type = "resnet18" #resnet34, resnet50
+
+    if "resnet18" == model_type:
+        model = test_resnet18(input_shape,n_classes)
+    elif "resnet34" == model_type:
+        model = test_resnet34(input_shape,n_classes)
+    elif "resnet50" == model_type:
+        model = test_resnet50(input_shape,n_classes)
+    model.summary()
+    nb_epoch = 50
+    batch_size = 128
+
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, verbose=1, mode='auto')
+    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.1,
+                                  patience=5, min_lr=0.000001, verbose=1)
+    mcp_save = ModelCheckpoint('./save/'+model_type+'.hdf5', save_best_only=True, monitor='val_loss', mode='min', verbose = 1)
+
+    predictions, history = run_resNet(input_shape)
+    draw_plot(predictions, y_test)

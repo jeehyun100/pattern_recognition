@@ -335,10 +335,10 @@ def load_datasets(data_path, npz=None , shuffle= False):#, activity_class="ALL",
                 print(cnt)
             #     break
         np_all_data = np.array(rowlist)
-        np.savez("./npz/activity_nparray2.npz", data = np_all_data)
+        np.savez("./npz/activity_nparray3.npz", data = np_all_data)
         print("save complete")
     else:
-        np_all_data = np.load("./npz/activity_nparray2.npz",allow_pickle=True)['data']
+        np_all_data = np.load("./npz/activity_nparray3.npz",allow_pickle=True)['data']
     tr_data, te_data,  = train_test_split(np_all_data,test_size=0.3,shuffle=shuffle,random_state=1004)
 
     return tr_data, te_data
@@ -563,9 +563,9 @@ if __name__ == "__main__":
     dataset = ['1', '2', '3', '4', '5', '6']
     #dataset = ['1', '2']
 
-    data_path = "./mlpr20_project_train_data"
+    data_path = "./new_dataset"
 
-    tr_data, te_data = load_datasets(data_path, False, shuffle= True)
+    tr_data, te_data = load_datasets(data_path, None, shuffle= True)
 
     # get initial value for vq
     # get_vg_train(tr_data[:,3])

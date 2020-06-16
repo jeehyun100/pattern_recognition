@@ -56,13 +56,13 @@ def stft(sig, nfft, win_length_time, hop_length_time, fs, window_type='hann'):
 
 def get_log_mel_transform(p_data):
     #_tmp = train_x[0, :, 0]
-    p_s = p_data[:,0]
-    nfft = 512
-    window_len = 0.4#0.3#0.5  # 1.0#0.3
-    hop_len = 0.1#0.1  # 0.5
+    nfft = 128
+    window_len = 1.3#0.3#0.5  # 1.0#0.3
+    hop_len = 0.3#0.1  # 0.5
     sr = 50
     win_type = 'hann'
-    n_coeff = 8
+    n_coeff = 48
+
 
     p_s = p_data[:,0]
     p_stft, freq_axis = stft(p_s, nfft, window_len, hop_len, sr, window_type=win_type)
@@ -197,10 +197,10 @@ def load_datasets(data_path, npz=None , shuffle= False):#, activity_class="ALL",
                 print(cnt)
             #     break
         np_all_data = np.array(rowlist)
-        np.savez("./npz/activity_nparray2.npz", data = np_all_data)
+        np.savez("./npz/activity_nparray3.npz", data = np_all_data)
         print("save complete")
     else:
-        np_all_data = np.load("./npz/activity_nparray2.npz",allow_pickle=True)['data']
+        np_all_data = np.load("./npz/activity_nparray3.npz",allow_pickle=True)['data']
     tr_data, te_data,  = train_test_split(np_all_data,test_size=0.3,shuffle=shuffle,random_state=1004)
 
     return tr_data, te_data
@@ -231,13 +231,22 @@ def plot_graph(tr_data, te_data):
     for i, label in enumerate(labels):
         x_train, y_train, x_test, y_test = load_datasets_by_label(tr_data, te_data,  label=i+1, type='raw')
 
+        random_raw = np.random.randint(x_train.shape[0], size=1)
         sr = 50
-        _tmp1 = x_train[0,:,0]
-        _tmp2 = x_train[0,:,1]
-        _tmp3 = x_train[0,:,2]
-        _tmp4 = x_train[0,:,3]
-        _tmp5 = x_train[0,:,4]
-        _tmp6 = x_train[0,:,5]
+        #x_train
+        _tmp1 = x_train[2,:,0]
+        _tmp2 = x_train[2,:,1]
+        _tmp3 = x_train[2,:,2]
+        _tmp4 = x_train[2,:,3]
+        _tmp5 = x_train[2,:,4]
+        _tmp6 = x_train[2,:,5]
+        # _tmp1 = x_train[random_raw,:,0]
+        # _tmp2 = x_train[random_raw,:,1]
+        # _tmp3 = x_train[random_raw,:,2]
+        # _tmp4 = x_train[random_raw,:,3]
+        # _tmp5 = x_train[random_raw,:,4]
+        # _tmp6 = x_train[random_raw,:,5]
+
         # We'll use the numpy function "linspace" to create a time axis for plotting
         p_timeaxis = np.linspace(0, (1 / sr * _tmp1.shape[0]), len(_tmp1))
 
@@ -259,13 +268,19 @@ def plot_graph(tr_data, te_data):
         plt.title(label)
         plt.show()
 
-        #p_s = p_data[:, 0]
-        nfft = 512
-        window_len = 0.4  # 0.3#0.5  # 1.0#0.3
-        hop_len = 0.1  # 0.1  # 0.5
+        # #p_s = p_data[:, 0]
+        # nfft = 512
+        # window_len = 0.4  # 0.3#0.5  # 1.0#0.3
+        # hop_len = 0.1  # 0.1  # 0.5
+        # sr = 50
+        # win_type = 'hann'
+        # n_coeff = 8
+        nfft = 128
+        window_len = 1.3  # 0.3#0.5  # 1.0#0.3
+        hop_len = 0.3  # 0.1  # 0.5
         sr = 50
         win_type = 'hann'
-        n_coeff = 8
+        n_coeff = 48
 
         p_s = _tmp1
         p_stft, freq_axis = stft(p_s, nfft, window_len, hop_len, sr, window_type=win_type)
@@ -369,17 +384,17 @@ def plot_graph(tr_data, te_data):
         plt.figure(figsize=(10, 4))
         #plt.ylim((_tmp_all.min(), _tmp_all.max()))
         plt.plot(vq_feature1)
-        plt.plot(_tmp1)
+        #plt.plot(_tmp1)
         plt.plot(vq_feature2)
-        plt.plot(_tmp2)
+        #plt.plot(_tmp2)
         plt.plot(vq_feature3)
-        plt.plot(_tmp3)
+        #plt.plot(_tmp3)
         plt.plot(vq_feature4)
-        plt.plot(_tmp4)
+        #plt.plot(_tmp4)
         plt.plot(vq_feature5)
-        plt.plot(_tmp5)
+        #plt.plot(_tmp5)
         plt.plot(vq_feature6)
-        plt.plot(_tmp6)
+        #plt.plot(_tmp6)
 
 
 
@@ -399,9 +414,6 @@ if __name__ == "__main__":
 
     data_path = "./mlpr20_project_train_data"
 
-    tr_data, te_data = load_datasets(data_path, False, shuffle= True)
-    #plot_graph()qq
+    tr_data, te_data = load_datasets(data_path, None, shuffle= True)
+
     plot_graph(tr_data, te_data )
-    #exam_all_train(tr_data, te_data )
-    #for i in range(6):
-    #load_datasets(data_path, True)

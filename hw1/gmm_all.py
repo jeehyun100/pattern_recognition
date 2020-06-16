@@ -9,6 +9,19 @@ import pandas as pd
 import os
 
 def plot_distribution(model, dataset, label, name):
+    """Draw contour graph and save graph
+
+    Args:
+        model (GaussianMixture) : Gmm object
+        dataset (ndarray) : X,Y data
+        label (int) : target value (0, 1)
+        name (string)  : name of model
+
+    Returns:
+        None
+         . just draw plot graph and save
+
+    """
     parameter = Config()
     x = np.linspace(-1.5, 1.5)
     y = np.linspace(-1.5, 1.5)  # 간격을 나눠주고
@@ -568,6 +581,8 @@ def redraw_lineplot():
     plot_line_graph(line_df, cv_types)
 
 if __name__ == "__main__":
+
+    os.makedirs("./plot/", exist_ok=True)
     # plot img directory check
     os.makedirs("./plot/", exist_ok=True)
     # result csv directory check

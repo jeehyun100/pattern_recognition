@@ -2,7 +2,7 @@
 # Reference: https://intellij-support.jetbrains.com/hc/en-us/articles/206544839
 
 # User-specific stuff
-.idea/**/workspace.xml
+.i/dea/**/workspace.xml
 .idea/**/tasks.xml
 .idea/**/usage.statistics.xml
 .idea/**/dictionaries
@@ -75,3 +75,7 @@ fabric.properties
 .DS_Store
 .ipynb_checkpoints/
 */.ipynb_checkpoints/
+/term/mlpr20_project_train_data/
+/term/csv/
+/term/.idea/
+*.npz
